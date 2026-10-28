@@ -12,7 +12,9 @@ export async function GET(req: Request) {
     const results = [
       ...tickers.filter((t) => t.ticker === upper),
       ...tickers.filter((t) => t.name.toLowerCase().startsWith(lower)),
-      ...tickers.filter((t) => t.name.toLowerCase().includes(lower) || t.ticker.startsWith(upper)),
+      ...tickers.filter((t) => t.ticker.startsWith(upper)),
+      // Match whole words in the name, so "NKE" doesn't pull in "Cullen/Frost Bankers".
+      ...tickers.filter((t) => t.name.toLowerCase().split(/[^a-z0-9&]+/).some((w) => w.startsWith(lower))),
     ].filter((t) => !seen.has(t.cik) && seen.add(t.cik)).slice(0, 8);
     return NextResponse.json({ results });
   } catch (e) {
