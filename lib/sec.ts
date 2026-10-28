@@ -34,8 +34,8 @@ export type Submissions = {
 const DAY = 24 * 60 * 60;
 
 function userAgent(): string {
-  // Tolerate a value pasted with quotes, which SEC would otherwise reject.
-  const ua = (process.env.SEC_USER_AGENT ?? "").trim().replace(/^["']|["']$/g, "").trim();
+  // Tolerate a value pasted with quotes or line breaks, which SEC would otherwise reject.
+  const ua = (process.env.SEC_USER_AGENT ?? "").replace(/\s+/g, " ").trim().replace(/^["']|["']$/g, "").trim();
   if (!ua) {
     throw new Error("SEC_USER_AGENT is not set. Add it in your Vercel project settings (see README).");
   }
