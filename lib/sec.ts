@@ -34,9 +34,13 @@ export type Submissions = {
 const DAY = 24 * 60 * 60;
 
 function userAgent(): string {
-  const ua = process.env.SEC_USER_AGENT;
+  // Tolerate a value pasted with quotes, which SEC would otherwise reject.
+  const ua = (process.env.SEC_USER_AGENT ?? "").trim().replace(/^["']|["']$/g, "").trim();
   if (!ua) {
     throw new Error("SEC_USER_AGENT is not set. Add it in your Vercel project settings (see README).");
+  }
+  if (!/\S+@\S+\.\S+/.test(ua)) {
+    throw new Error('SEC_USER_AGENT needs an app name and a contact email, like "IB Comps Builder you@school.edu".');
   }
   return ua;
 }
@@ -55,6 +59,11 @@ async function secFetch(url: string, revalidate: number): Promise<Response> {
     headers: { "User-Agent": userAgent(), Accept: "application/json, application/atom+xml" },
     next: { revalidate },
   });
+  if (res.status === 403) {
+    throw new Error(
+      "SEC refused the request (403). Check that SEC_USER_AGENT is an app name plus a real contact email with no quotes, then redeploy.",
+    );
+  }
   if (!res.ok) throw new Error(`SEC request failed (${res.status}): ${url}`);
   return res;
 }

@@ -93,7 +93,7 @@ describe("buildWorkbook", () => {
       { ticker: "PEER", data, quote: null },
     ]);
     const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(buf);
+    await wb.xlsx.load(buf as unknown as ArrayBuffer);
     expect(wb.worksheets.map((w) => w.name)).toEqual(["Comps", "EXM", "PEER", "Sources"]);
 
     const ws = wb.getWorksheet("EXM")!;
