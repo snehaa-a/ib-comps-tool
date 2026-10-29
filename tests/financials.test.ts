@@ -102,10 +102,53 @@ describe("buildWorkbook", () => {
 
     const comps = wb.getWorksheet("Comps")!;
     expect(comps.getCell("B5").value).toBe("EXM");
-    expect((comps.getCell("J5").value as { formula: string }).formula).toMatch(/^'EXM'!B\d+$/);
+    expect((comps.getCell("J5").value as { formula: string }).formula).toMatch(/^IF\('EXM'!B\d+="","",'EXM'!B\d+\)$/);
     expect((comps.getCell("J9").value as { formula: string }).formula).toBe('IFERROR(AVERAGE(J7:J7),"NM")');
 
     const sources = wb.getWorksheet("Sources")!;
     expect(sources.rowCount).toBeGreaterThan(10);
+  });
+});
+
+describe("fallbacks found testing Nike on live SEC data", () => {
+  // Nike: no OperatingIncomeLoss, no InterestExpense, and a cover share count from 2015
+  // because later filings tag Class A and B separately.
+  function nikeLike(): CompanyFacts {
+    const f = fixture();
+    const g = f.facts["us-gaap"];
+    delete g.OperatingIncomeLoss;
+    const usd = (list: FactEntry[]) => ({ units: { USD: list } });
+    g.IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest = usd([
+      e("2024-06-01", "2025-05-31", 160e6, "10-K", "2025-07-20"),
+      e("2024-06-01", "2024-08-31", 40e6, "10-Q", "2025-10-05"),
+      e("2025-06-01", "2025-08-31", 45e6, "10-Q", "2025-10-05"),
+    ]);
+    g.InterestIncomeExpenseNonoperatingNet = usd([
+      e("2024-06-01", "2025-05-31", 10e6, "10-K", "2025-07-20"),
+      e("2024-06-01", "2024-08-31", 3e6, "10-Q", "2025-10-05"),
+      e("2025-06-01", "2025-08-31", 2e6, "10-Q", "2025-10-05"),
+    ]);
+    g.WeightedAverageNumberOfDilutedSharesOutstanding = {
+      units: { shares: [e("2024-06-01", "2025-05-31", 1490e6, "10-K", "2025-07-20"), e("2025-06-01", "2025-08-31", 1484e6, "10-Q", "2025-10-05")] },
+    };
+    f.facts.dei.EntityCommonStockSharesOutstanding.units.shares = [e(undefined, "2015-07-17", 855e6, "10-K", "2015-07-23")];
+    return f;
+  }
+
+  it("replaces a stale cover share count with the latest diluted average", () => {
+    const s = extract(nikeLike()).sharesOutstanding;
+    expect(s).toMatchObject({ basis: "diluted average", val: 1484e6, end: "2025-08-31" });
+  });
+
+  it("derives EBIT from pre-tax income and net interest when it isn't tagged", async () => {
+    const buf = await buildWorkbook({ ticker: "NKE", data: extract(nikeLike()), quote: null }, []);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as ArrayBuffer);
+    const ws = wb.getWorksheet("NKE")!;
+    const label = (r: number) => ws.getCell(`A${r}`).value;
+    const ebitRow = [...Array(30).keys()].find((r) => String(label(r + 1)).startsWith("EBIT ("))! + 1;
+    const pretaxRow = [...Array(30).keys()].find((r) => String(label(r + 1)).startsWith("Pre-tax"))! + 1;
+    const netIntRow = [...Array(30).keys()].find((r) => String(label(r + 1)).startsWith("Interest income"))! + 1;
+    expect(ws.getCell(`G${ebitRow}`).value).toMatchObject({ formula: `G${pretaxRow}-G${netIntRow}` });
   });
 });

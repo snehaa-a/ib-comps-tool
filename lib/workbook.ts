@@ -33,13 +33,17 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
   const name = sheetName(c.ticker);
   const ws = wb.addWorksheet(name);
   const d = c.data;
-  ws.columns = [{ width: 38 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }];
+  ws.columns = [{ width: 46 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }];
 
   ws.getCell("A1").value = `${d.name} (${c.ticker})`;
   ws.getCell("A1").font = { bold: true, size: 14 };
   ws.getCell("A2").value = "$ in millions, except per-share data. Shares in millions. Source: SEC EDGAR XBRL filings.";
   ws.getCell("A3").value = "Blue = value from a filing (see Sources tab). Black = formula. A blank cell means no matching tag was found: check the filing.";
   ws.getCell("A2").font = ws.getCell("A3").font = { italic: true, color: { argb: "FF595959" } };
+  if (!d.fyEnds.length && !d.balanceDate) {
+    ws.getCell("A4").value = "No US-GAAP financials found. This company likely reports under IFRS (Form 20-F or 40-F): fill this tab from its annual report.";
+    ws.getCell("A4").font = { bold: true, color: { argb: "FFC00000" } };
+  }
 
   // Columns B..D = fiscal years (oldest first), E = prior YTD, F = current YTD, G = LTM.
   const fyCols = ["B", "C", "D"].slice(3 - d.fyEnds.length);
@@ -56,27 +60,49 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
   ws.getCell("G6").value = d.ytd ? `through ${d.ytd.end}` : "= latest FY";
   dates.font = { italic: true, size: 9, color: { argb: "FF595959" } };
 
-  const order = ["revenue", "cogs", "grossProfit", "sga", "rnd", "ebit", "da", "ebitda", "interestExpense", "pretaxIncome", "taxes", "netIncome", "epsDiluted", "dilutedShares", "sbc", "cfo", "capex", "fcf"];
+  const order = ["revenue", "cogs", "grossProfit", "sga", "rnd", "ebit", "da", "ebitda", "interestExpense", "netInterestIncome", "pretaxIncome", "taxes", "netIncome", "epsDiluted", "dilutedShares", "sbc", "cfo", "capex", "fcf"];
   const rowOf: Record<string, number> = {};
   order.forEach((k, i) => (rowOf[k] = 7 + i));
   const lastFy = fyCols.at(-1) ?? "D";
   const allCols = [...fyCols, "E", "F"];
 
+  // Rows a company didn't tag in any period are rebuilt from other rows, so the
+  // multiples still work. Nike, for one, tags neither operating income nor interest expense.
+  const tagged = (key: string) => {
+    const item = d.duration[key];
+    return !!item && (item.fy.some(Boolean) || !!item.ytd || !!item.ytdPrior);
+  };
+  const cellOf = (col: string, key: string) => `${col}${rowOf[key]}`;
+  const derived: Record<string, { label: string; f: (col: string) => string }> = {
+    ebitda: { label: "EBITDA (EBIT + D&A)", f: (c) => `${cellOf(c, "ebit")}+${cellOf(c, "da")}` },
+    fcf: { label: "Free cash flow (CFO − capex)", f: (c) => `${cellOf(c, "cfo")}-${cellOf(c, "capex")}` },
+  };
+  if (!d.duration.grossProfit.fy.some(Boolean)) {
+    derived.grossProfit = { label: "Gross profit (revenue − cost of revenue)", f: (c) => `${cellOf(c, "revenue")}-${cellOf(c, "cogs")}` };
+  }
+  if (!tagged("pretaxIncome")) {
+    derived.pretaxIncome = { label: "Pre-tax income (net income + taxes)", f: (c) => `${cellOf(c, "netIncome")}+${cellOf(c, "taxes")}` };
+  }
+  if (!tagged("ebit")) {
+    if (tagged("interestExpense")) {
+      derived.ebit = { label: "EBIT (pre-tax income + interest expense)", f: (c) => `${cellOf(c, "pretaxIncome")}+${cellOf(c, "interestExpense")}` };
+    } else if (tagged("netInterestIncome")) {
+      derived.ebit = { label: "EBIT (pre-tax income − net interest income)", f: (c) => `${cellOf(c, "pretaxIncome")}-${cellOf(c, "netInterestIncome")}` };
+    }
+  }
+
   for (const key of order) {
     const r = rowOf[key];
     const def = DURATION_ITEMS.find((x) => x.key === key);
     const fmt = def?.unit === "USD/shares" ? EPS : NUM;
-    ws.getCell(`A${r}`).value = def?.label ?? (key === "ebitda" ? "EBITDA (EBIT + D&A)" : "Free cash flow (CFO − capex)");
+    ws.getCell(`A${r}`).value = derived[key]?.label ?? def?.label ?? key;
 
-    if (!def || (key === "grossProfit" && !d.duration.grossProfit.fy.some(Boolean))) {
+    if (derived[key]) {
       // Derived rows: written as formulas in every column, including LTM.
-      const f = (col: string) =>
-        key === "ebitda" ? `${col}${rowOf.ebit}+${col}${rowOf.da}` :
-        key === "fcf" ? `${col}${rowOf.cfo}-${col}${rowOf.capex}` :
-        `${col}${rowOf.revenue}-${col}${rowOf.cogs}`;
+      const f = derived[key].f;
       for (const col of [...allCols, "G"]) ws.getCell(`${col}${r}`).value = { formula: f(col) };
       if (key === "ebitda") ws.getRow(r).font = { bold: true };
-    } else {
+    } else if (def) {
       const item = d.duration[key];
       const put = (col: string, s: Sourced | null, period: string) => {
         if (!s) return;
@@ -141,24 +167,32 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
   ws.getCell(price).font = { color: BLUE };
   ws.getCell(price).fill = INPUT_FILL;
   const sh = d.sharesOutstanding;
-  const shares = line(sh ? `Shares outstanding (m, cover page ${sh.end})` : "Shares outstanding (m) — enter from 10-Q cover", sh ? sh.val / 1e6 : null, NUM);
+  const sharesLabel = !sh
+    ? "Shares outstanding (m) — enter from 10-Q cover"
+    : sh.basis === "cover"
+      ? `Shares outstanding (m, cover page ${sh.end})`
+      : sh.basis === "balance sheet"
+        ? `Shares outstanding (m, balance sheet ${sh.end})`
+        : `Diluted avg. shares (m, period to ${sh.end}) — check 10-Q cover`;
+  const shares = line(sharesLabel, sh ? sh.val / 1e6 : null, NUM);
   ws.getCell(shares).font = { color: BLUE };
-  if (sh) sources.push({ ticker: c.ticker, item: "Shares outstanding", period: `as of ${sh.end}`, s: sh, cik: d.cik });
-  else ws.getCell(shares).fill = INPUT_FILL;
+  if (sh) sources.push({ ticker: c.ticker, item: sh.basis === "diluted average" ? "Diluted average shares" : "Shares outstanding", period: `as of ${sh.end}`, s: sh, cik: d.cik });
+  if (!sh || sh.basis === "diluted average") ws.getCell(shares).fill = INPUT_FILL;
 
-  const equity = line("Equity value", { formula: `${price}*${shares}` }, NUM, true);
+  // Equity value and EV stay blank until a price is in, so the multiples read NM, not 0.0x.
+  const equity = line("Equity value", { formula: `IF(ISNUMBER(${price}),${price}*${shares},"")` }, NUM, true);
   const debt = line("+ Total debt", { formula: `${bs.shortTermDebt}+${bs.currentLtd}+${bs.longTermDebt}` }, NUM);
   const pref = line("+ Preferred stock", { formula: bs.preferred }, NUM);
   const nci = line("+ Noncontrolling interest", { formula: bs.nci }, NUM);
   const cash = line("− Cash and short-term investments", { formula: `${bs.cash}+${bs.stInvestments}` }, NUM);
-  const ev = line("Enterprise value", { formula: `${equity}+${debt}+${pref}+${nci}-${cash}` }, NUM, true);
+  const ev = line("Enterprise value", { formula: `IF(ISNUMBER(${equity}),${equity}+${debt}+${pref}+${nci}-${cash},"")` }, NUM, true);
 
   r++;
   const g = (k: string) => `G${rowOf[k]}`;
   const evRev = line("EV / LTM revenue", { formula: `IFERROR(${ev}/${g("revenue")},"NM")` }, MULT);
   const evEbitda = line("EV / LTM EBITDA", { formula: `IFERROR(IF(${g("ebitda")}<=0,"NM",${ev}/${g("ebitda")}),"NM")` }, MULT);
   const evEbit = line("EV / LTM EBIT", { formula: `IFERROR(IF(${g("ebit")}<=0,"NM",${ev}/${g("ebit")}),"NM")` }, MULT);
-  const pe = line("P / E (LTM diluted EPS)", { formula: `IFERROR(IF(${g("epsDiluted")}<=0,"NM",${price}/${g("epsDiluted")}),"NM")` }, MULT);
+  const pe = line("P / E (LTM diluted EPS)", { formula: `IFERROR(IF(OR(NOT(ISNUMBER(${price})),${g("epsDiluted")}<=0),"NM",${price}/${g("epsDiluted")}),"NM")` }, MULT);
   ws.views = [{ state: "frozen", ySplit: 5, xSplit: 1 }];
 
   const at = (cell: string) => ref(name, cell);
@@ -191,7 +225,9 @@ export async function buildWorkbook(target: CompanyInput, peers: CompanyInput[])
   const fmts = [undefined, undefined, "0.00", NUM, NUM, NUM, NUM, NUM, NUM, MULT, MULT, MULT, MULT];
   const writeRow = (rowNum: number, c: CompanyInput, x: Cells) => {
     const row = comps.getRow(rowNum);
-    row.values = [x.name, c.ticker, ...[x.price, x.equity, x.ev, x.rev, x.ebitda, x.ebit, x.ni, x.evRev, x.evEbitda, x.evEbit, x.pe].map((f) => ({ formula: f }))];
+    // Blank source cells come through as blank rather than 0.
+    const link = (f: string) => ({ formula: `IF(${f}="","",${f})` });
+    row.values = [x.name, c.ticker, ...[x.price, x.equity, x.ev, x.rev, x.ebitda, x.ebit, x.ni, x.evRev, x.evEbitda, x.evEbit, x.pe].map(link)];
     fmts.forEach((f, i) => f && (row.getCell(i + 1).numFmt = f));
   };
 

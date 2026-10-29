@@ -26,6 +26,7 @@ export const DURATION_ITEMS: ItemDef[] = [
   { key: "rnd", label: "R&D", unit: "USD", tags: ["ResearchAndDevelopmentExpense", "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"] },
   { key: "ebit", label: "Operating income (EBIT)", unit: "USD", tags: ["OperatingIncomeLoss"] },
   { key: "interestExpense", label: "Interest expense", unit: "USD", tags: ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt"] },
+  { key: "netInterestIncome", label: "Interest income (expense), net", unit: "USD", tags: ["InterestIncomeExpenseNonoperatingNet", "InterestIncomeExpenseNet"] },
   { key: "pretaxIncome", label: "Pre-tax income", unit: "USD", tags: ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"] },
   { key: "taxes", label: "Income taxes", unit: "USD", tags: ["IncomeTaxExpenseBenefit"] },
   { key: "netIncome", label: "Net income", unit: "USD", tags: ["NetIncomeLoss", "ProfitLoss"] },
@@ -39,7 +40,7 @@ export const DURATION_ITEMS: ItemDef[] = [
 
 export const INSTANT_ITEMS: ItemDef[] = [
   { key: "cash", label: "Cash and equivalents", unit: "USD", tags: ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "Cash"] },
-  { key: "stInvestments", label: "Short-term investments", unit: "USD", tags: ["ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"] },
+  { key: "stInvestments", label: "Short-term investments", unit: "USD", tags: ["ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent"] },
   { key: "shortTermDebt", label: "Short-term borrowings", unit: "USD", tags: ["ShortTermBorrowings", "CommercialPaper"] },
   { key: "currentLtd", label: "Current portion of long-term debt", unit: "USD", tags: ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent"] },
   { key: "longTermDebt", label: "Long-term debt", unit: "USD", tags: ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"] },
@@ -69,8 +70,11 @@ export type Extracted = {
   duration: Record<string, { fy: (Sourced | null)[]; ytd: Sourced | null; ytdPrior: Sourced | null }>;
   balanceDate: string | null;
   instant: Record<string, Sourced | null>;
-  sharesOutstanding: Sourced | null;
+  sharesOutstanding: Shares | null;
 };
+
+// Where the share count came from. The cover page is the standard; the others are fallbacks.
+export type Shares = Sourced & { basis: "cover" | "balance sheet" | "diluted average" };
 
 function entries(facts: CompanyFacts, tag: string, unit: string): FactEntry[] {
   return facts.facts["us-gaap"]?.[tag]?.units?.[unit] ?? [];
@@ -154,22 +158,37 @@ export function extract(facts: CompanyFacts): Extracted {
     duration,
     balanceDate,
     instant,
-    sharesOutstanding: sharesOutstanding(facts),
+    sharesOutstanding: sharesOutstanding(facts, balanceDate),
   };
 }
 
-// Cover-page share count from the latest filing, summed across share classes.
-export function sharesOutstanding(facts: CompanyFacts): Sourced | null {
+// Share count, preferring the cover page of the latest filing summed across share classes.
+// Companies with several share classes tag the cover count by class, which companyfacts
+// leaves out, so their only undimensioned cover value can be years old (Nike's is from 2015).
+// A stale cover count falls back to the balance sheet, then to the latest diluted average.
+export function sharesOutstanding(facts: CompanyFacts, balanceDate: string | null): Shares | null {
   const list = facts.facts.dei?.EntityCommonStockSharesOutstanding?.units?.shares ?? [];
-  if (!list.length) return null;
-  const latest = list.reduce((m, e) => (e.filed > m.filed ? e : m));
-  const sameFiling = list.filter((e) => e.accn === latest.accn && e.end === latest.end);
-  return {
-    val: sameFiling.reduce((s, e) => s + e.val, 0),
-    tag: "dei:EntityCommonStockSharesOutstanding",
-    end: latest.end,
-    form: latest.form,
-    filed: latest.filed,
-    accn: latest.accn,
-  };
+  if (list.length) {
+    const latest = list.reduce((m, e) => (e.filed > m.filed ? e : m));
+    if (!balanceDate || days(balanceDate, latest.end) > -180) {
+      const sameFiling = list.filter((e) => e.accn === latest.accn && e.end === latest.end);
+      return {
+        val: sameFiling.reduce((s, e) => s + e.val, 0),
+        tag: "dei:EntityCommonStockSharesOutstanding",
+        end: latest.end,
+        form: latest.form,
+        filed: latest.filed,
+        accn: latest.accn,
+        basis: "cover",
+      };
+    }
+  }
+  if (balanceDate) {
+    const bs = pick(entries(facts, "CommonStockSharesOutstanding", "shares"), "CommonStockSharesOutstanding", (e) => !e.start && e.end === balanceDate);
+    if (bs) return { ...bs, basis: "balance sheet" };
+  }
+  const diluted = entries(facts, "WeightedAverageNumberOfDilutedSharesOutstanding", "shares");
+  const lastEnd = diluted.reduce((m, e) => (e.end > m ? e.end : m), "");
+  const avg = pick(diluted, "WeightedAverageNumberOfDilutedSharesOutstanding", (e) => e.end === lastEnd);
+  return avg && { ...avg, basis: "diluted average" };
 }

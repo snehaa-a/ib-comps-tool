@@ -43,3 +43,6 @@ npm test
 - Forward (NTM) estimates aren't available from free sources.
 - Some companies use custom tags, which leave a blank cell with a note. Check the filing for those.
 - EBITDA is EBIT plus cash-flow D&A, without adjustments for one-off items.
+- When a company doesn't tag a line in any period, the tab rebuilds it with a formula and says so in the label: EBIT from pre-tax income and interest (Nike), pre-tax income from net income plus taxes (Deckers), gross profit from revenue less cost of revenue.
+- Companies with several share classes (Nike, Under Armour, Levi's) tag their cover-page share count by class, which the SEC API leaves out. Their tab uses the latest diluted average share count instead, highlighted yellow, so check it against the 10-Q cover.
+- Peer suggestions skip companies with no US-GAAP revenue (shells and IFRS filers such as On Holding). When the target's own industry code has few filers, related codes fill the list.
