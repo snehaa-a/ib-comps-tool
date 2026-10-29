@@ -94,7 +94,7 @@ describe("buildWorkbook", () => {
     ]);
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(buf as unknown as ArrayBuffer);
-    expect(wb.worksheets.map((w) => w.name)).toEqual(["Comps", "EXM", "PEER", "Sources"]);
+    expect(wb.worksheets.map((w) => w.name)).toEqual(["Comps", "Checks", "EXM", "PEER", "Sources"]);
 
     const ws = wb.getWorksheet("EXM")!;
     expect(ws.getCell("D7").value).toBe(1100); // FY revenue in $m
@@ -150,5 +150,48 @@ describe("fallbacks found testing Nike on live SEC data", () => {
     const pretaxRow = [...Array(30).keys()].find((r) => String(label(r + 1)).startsWith("Pre-tax"))! + 1;
     const netIntRow = [...Array(30).keys()].find((r) => String(label(r + 1)).startsWith("Interest income"))! + 1;
     expect(ws.getCell(`G${ebitRow}`).value).toMatchObject({ formula: `G${pretaxRow}-G${netIntRow}` });
+  });
+});
+
+describe("Checks tab", () => {
+  async function checksFor(facts: CompanyFacts, quote: { price: number; source: string } | null) {
+    const buf = await buildWorkbook({ ticker: "EXM", data: extract(facts), quote }, [{ ticker: "PEER", data: extract(fixture()), quote }]);
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as ArrayBuffer);
+    const ws = wb.getWorksheet("Checks")!;
+    const rows: { ticker: string; level: string; message: string; where: unknown; status: unknown }[] = [];
+    for (let r = 5; r <= ws.rowCount; r++) {
+      const level = ws.getCell(`B${r}`).value;
+      if (level === "Fix" || level === "Review" || level === "FYI") {
+        rows.push({ ticker: String(ws.getCell(`A${r}`).value), level, message: String(ws.getCell(`C${r}`).value), where: ws.getCell(`D${r}`).value, status: ws.getCell(`F${r}`).value });
+      }
+    }
+    return { ws, rows };
+  }
+
+  it("lists blanks to fill first, with a link to the cell and a self-updating status", async () => {
+    const { rows } = await checksFor(fixture(), null);
+    expect(rows[0].level).toBe("Fix");
+    const price = rows.find((r) => r.ticker === "EXM" && r.message.startsWith("Enter today's share price"))!;
+    expect(price.where).toMatchObject({ text: "Go to cell", hyperlink: expect.stringMatching(/^#'EXM'!B\d+$/) });
+    expect(price.status).toMatchObject({ formula: expect.stringMatching(/^IF\(ISNUMBER\('EXM'!B\d+\),"Done","To do"\)$/) });
+  });
+
+  it("flags big year-over-year moves, missing debt and estimated figures for review", async () => {
+    const f = fixture();
+    // Net income fell from 95 to 20 (-79%).
+    f.facts["us-gaap"].NetIncomeLoss.units.USD.push(e("2024-06-01", "2025-05-31", 20e6, "10-K", "2025-08-01"));
+    const { rows } = await checksFor(f, { price: 20, source: "test" });
+    const msgs = rows.filter((r) => r.ticker === "EXM").map((r) => `${r.level}: ${r.message}`);
+    expect(msgs).toContainEqual(expect.stringMatching(/^Review: Net income changed -79% from FY 2024 to FY 2025/));
+    expect(msgs).not.toContainEqual(expect.stringMatching(/No debt found/)); // the fixture has long-term debt
+    expect(msgs).not.toContainEqual(expect.stringMatching(/share price/));
+  });
+
+  it("adds outlier formulas against the peer median", async () => {
+    const { ws } = await checksFor(fixture(), null);
+    const cells: string[] = [];
+    ws.eachRow((row) => row.eachCell((c) => typeof c.value === "object" && c.value && "formula" in c.value && cells.push(String(c.value.formula))));
+    expect(cells).toContainEqual(expect.stringContaining("Comps!K7>2*Comps!K"));
   });
 });
