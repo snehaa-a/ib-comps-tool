@@ -6,6 +6,7 @@ A free web app for investment banking students. Type a public company, confirm i
 
 - **Comps tab:** the target and each peer on one row with share price, equity value, enterprise value, LTM revenue, EBITDA, EBIT and net income, and EV/Revenue, EV/EBITDA, EV/EBIT and P/E. Peer mean, median, 25th and 75th percentile.
 - **One tab per company:** last three fiscal years, prior and current year-to-date, and LTM (`FY + YTD current − YTD prior`) for the income statement and cash flow items. Also the latest balance sheet and the bridge from equity value to enterprise value.
+- **Checks tab:** a to-do list of what to verify. Each row is marked Fix (a blank to fill), Review (a number that was estimated, or that moved more than 50% year over year) or FYI (fiscal periods that don't line up). It links straight to the cell and, where there is one, to the filing. Fix rows switch to "Done" once the cell is filled. A second table flags peer multiples above 2x or below half the peer median as soon as prices are entered.
 - **Sources tab:** every hard-coded number with its XBRL tag, period, form, filing date and a link to the filing.
 
 Blue font marks values from filings and black marks formulas. Yellow cells are inputs for the student, such as the share price when no price key is set.

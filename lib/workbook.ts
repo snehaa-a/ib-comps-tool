@@ -1,4 +1,5 @@
-// Builds the comps workbook: one tab per company, a Comps summary and a Sources tab.
+// Builds the comps workbook: a Comps summary, a Checks list of what to verify,
+// one tab per company and a Sources tab.
 // Banking conventions: blue font = hard-coded input from a filing, black = formula.
 
 import ExcelJS from "exceljs";
@@ -21,6 +22,14 @@ const sheetName = (ticker: string) => ticker.replace(/[\\/?*[\]:]/g, "-").slice(
 
 type SourceRow = { ticker: string; item: string; period: string; s: Sourced; cik: number };
 
+// One thing for the student to verify. "Fix" rows have a cell to fill in and track
+// their own status; "Review" rows need judgment; "FYI" rows are context.
+type Check = { ticker: string; level: "Fix" | "Review" | "FYI"; message: string; sheet: string; cell: string; filing?: string; fillCell?: boolean };
+const LEVEL_ORDER = { Fix: 0, Review: 1, FYI: 2 };
+
+const days = (a: string, b: string) => (Date.parse(b) - Date.parse(a)) / 86_400_000;
+const pct = (x: number) => `${x > 0 ? "+" : ""}${Math.round(x * 100)}%`;
+
 // Rows on each company tab that the Comps tab points at.
 type Cells = { name: string; price: string; equity: string; ev: string; rev: string; ebitda: string; ebit: string; ni: string; evRev: string; evEbitda: string; evEbit: string; pe: string };
 
@@ -29,10 +38,12 @@ function headerRow(row: ExcelJS.Row) {
   row.eachCell((c) => (c.fill = HEADER_FILL));
 }
 
-function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[]): Cells {
+function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[], checks: Check[]): Cells {
   const name = sheetName(c.ticker);
   const ws = wb.addWorksheet(name);
   const d = c.data;
+  const check = (level: Check["level"], message: string, cell: string, extra: Partial<Check> = {}) =>
+    checks.push({ ticker: c.ticker, level, message, sheet: name, cell, ...extra });
   ws.columns = [{ width: 46 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }];
 
   ws.getCell("A1").value = `${d.name} (${c.ticker})`;
@@ -43,6 +54,7 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
   if (!d.fyEnds.length && !d.balanceDate) {
     ws.getCell("A4").value = "No US-GAAP financials found. This company likely reports under IFRS (Form 20-F or 40-F): fill this tab from its annual report.";
     ws.getCell("A4").font = { bold: true, color: { argb: "FFC00000" } };
+    check("Fix", "No US-GAAP financials in SEC data (likely an IFRS filer). Fill this tab from the annual report.", "A4");
   }
 
   // Columns B..D = fiscal years (oldest first), E = prior YTD, F = current YTD, G = LTM.
@@ -123,9 +135,46 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
         if (item.ytd) ltm.value = { formula: `F${r}` };
       } else if (lastFyVal && item.ytd && item.ytdPrior) {
         ltm.value = { formula: `${lastFy}${r}+F${r}-E${r}` };
+      } else if (lastFyVal) {
+        // A year-to-date value is missing: LTM fills in once the student adds it.
+        ltm.value = { formula: `IF(AND(ISNUMBER(F${r}),ISNUMBER(E${r})),${lastFy}${r}+F${r}-E${r},"")` };
       }
     }
     for (const col of [...allCols, "G"]) ws.getCell(`${col}${r}`).numFmt = fmt;
+  }
+
+  const hasData = d.fyEnds.length > 0;
+  const fyLabel = (i: number) => `FY ${d.fyEnds[i].slice(0, 4)}`;
+  for (const key of hasData ? ["revenue", "ebit", "da", "netIncome", "epsDiluted"] : []) {
+    const r = rowOf[key];
+    if (derived[key]) {
+      check("Review", `${derived[key].label.replace(/ \(.*/, "")} is calculated as ${derived[key].label.match(/\((.*)\)/)?.[1]}, because the company doesn't report that line. Compare with its income statement.`, `G${r}`);
+      continue;
+    }
+    const def = DURATION_ITEMS.find((x) => x.key === key)!;
+    const item = d.duration[key];
+    if (!item.fy.at(-1)) {
+      check("Fix", `${def.label} is blank for ${fyLabel(d.fyEnds.length - 1)}. Find it in the 10-K.`, `${lastFy}${r}`, { fillCell: true });
+    } else if (d.ytd && (!item.ytd || !item.ytdPrior)) {
+      const col = item.ytd ? "E" : "F";
+      check("Fix", `LTM ${def.label.toLowerCase()} needs the ${col === "F" ? "current" : "prior"} year-to-date value. Find it in the 10-Q.`, `${col}${r}`, { fillCell: true });
+    }
+  }
+
+  // Big year-over-year moves usually mean an acquisition, divestiture, one-time charge or restatement.
+  for (const key of hasData ? ["revenue", "ebit", "netIncome"] : []) {
+    if (derived[key]) continue;
+    const def = DURATION_ITEMS.find((x) => x.key === key)!;
+    const fy = d.duration[key].fy;
+    for (let i = 1; i < fy.length; i++) {
+      const a = fy[i - 1], b = fy[i];
+      if (!a || !b || a.val === 0) continue;
+      const change = (b.val - a.val) / Math.abs(a.val);
+      const flipped = Math.sign(a.val) !== Math.sign(b.val);
+      if (!flipped && Math.abs(change) <= 0.5) continue;
+      const what = flipped ? `went from ${a.val < 0 ? "a loss" : "a profit"} to ${b.val < 0 ? "a loss" : "a profit"}` : `changed ${pct(change)}`;
+      check("Review", `${def.label} ${what} from ${fyLabel(i - 1)} to ${fyLabel(i)}. Check the 10-K for an acquisition, divestiture, one-time charge or restatement.`, `${fyCols[i]}${rowOf[key]}`, { filing: filingIndexUrl(d.cik, b.accn) });
+    }
   }
 
   // Balance sheet, latest reported date.
@@ -146,6 +195,15 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
     }
     cell.numFmt = NUM;
     bs[def.key] = `B${r}`;
+  }
+
+  if (d.balanceDate) {
+    if (!d.instant.cash) check("Fix", "Cash is blank. Find it on the latest balance sheet.", bs.cash, { fillCell: true });
+    if (!d.instant.shortTermDebt && !d.instant.currentLtd && !d.instant.longTermDebt) {
+      check("Review", "No debt found. Confirm in the debt footnote that the company has no borrowings.", bs.longTermDebt);
+    }
+    const age = days(d.balanceDate, new Date().toISOString().slice(0, 10));
+    if (age > 200) check("FYI", `The latest balance sheet in SEC data is from ${d.balanceDate}. Check EDGAR for a newer 10-Q.`, bs.cash);
   }
 
   // Market data and the bridge from equity value to enterprise value.
@@ -178,6 +236,12 @@ function companySheet(wb: ExcelJS.Workbook, c: CompanyInput, sources: SourceRow[
   ws.getCell(shares).font = { color: BLUE };
   if (sh) sources.push({ ticker: c.ticker, item: sh.basis === "diluted average" ? "Diluted average shares" : "Shares outstanding", period: `as of ${sh.end}`, s: sh, cik: d.cik });
   if (!sh || sh.basis === "diluted average") ws.getCell(shares).fill = INPUT_FILL;
+  if (!c.quote) check("Fix", "Enter today's share price.", price, { fillCell: true });
+  if (!sh) {
+    if (hasData) check("Fix", "Share count is blank. Enter shares outstanding from the latest 10-Q cover page.", shares, { fillCell: true });
+  } else if (sh.basis !== "cover") {
+    check("Review", `Share count is the ${sh.basis} figure as of ${sh.end}, not the latest cover page. Replace it with the 10-Q cover count, adding up all share classes.`, shares, { filing: filingIndexUrl(d.cik, sh.accn) });
+  }
 
   // Equity value and EV stay blank until a price is in, so the multiples read NM, not 0.0x.
   const equity = line("Equity value", { formula: `IF(ISNUMBER(${price}),${price}*${shares},"")` }, NUM, true);
@@ -207,9 +271,11 @@ export async function buildWorkbook(target: CompanyInput, peers: CompanyInput[])
   const wb = new ExcelJS.Workbook();
   wb.creator = "IB Comps Tool";
   const comps = wb.addWorksheet("Comps");
+  const checksSheet = wb.addWorksheet("Checks");
   const sources: SourceRow[] = [];
+  const checks: Check[] = [];
   const all = [target, ...peers];
-  const cells = all.map((c) => companySheet(wb, c, sources));
+  const cells = all.map((c) => companySheet(wb, c, sources, checks));
 
   comps.getCell("A1").value = `Trading comparables: ${target.data.name}`;
   comps.getCell("A1").font = { bold: true, size: 14 };
@@ -259,6 +325,21 @@ export async function buildWorkbook(target: CompanyInput, peers: CompanyInput[])
   }
   comps.views = [{ state: "frozen", ySplit: 4, xSplit: 1 }];
 
+  // Peers whose latest data ends far from the target's: LTM periods won't line up.
+  const through = (d: Extracted) => d.ytd?.end ?? d.fyEnds.at(-1);
+  const targetThrough = through(target.data);
+  peers.forEach((p, i) => {
+    const t = through(p.data);
+    if (targetThrough && t && Math.abs(days(t, targetThrough)) > 100) {
+      checks.push({
+        ticker: p.ticker, level: "FYI", sheet: sheetName(p.ticker), cell: "G6",
+        message: `LTM runs through ${t}, versus ${targetThrough} for ${target.ticker}. Normal for a different fiscal year, but worth noting when comparing.`,
+      });
+    }
+  });
+
+  writeChecks(checksSheet, checks, peers.length ? { first, last, median: last + 3 } : null, peers.map((p, i) => ({ ticker: p.ticker, row: first + i })));
+
   const src = wb.addWorksheet("Sources");
   src.columns = [
     { header: "Ticker", width: 10 }, { header: "Line item", width: 34 }, { header: "Period", width: 26 },
@@ -275,4 +356,60 @@ export async function buildWorkbook(target: CompanyInput, peers: CompanyInput[])
   src.views = [{ state: "frozen", ySplit: 1 }];
 
   return Buffer.from(await wb.xlsx.writeBuffer());
+}
+
+function writeChecks(ws: ExcelJS.Worksheet, checks: Check[], stats: { first: number; last: number; median: number } | null, peerRows: { ticker: string; row: number }[]) {
+  ws.columns = [{ width: 10 }, { width: 9 }, { width: 90 }, { width: 14 }, { width: 14 }, { width: 10 }];
+  ws.getCell("A1").value = "Checks: what to verify before using this workbook";
+  ws.getCell("A1").font = { bold: true, size: 14 };
+  ws.getCell("A2").value = "Fix = fill in a blank. Review = compare with the filing. FYI = context. Click Go to cell to jump to the number; Open filing opens the SEC filing it came from.";
+  ws.getCell("A2").font = { italic: true, color: { argb: "FF595959" } };
+
+  const head = ws.getRow(4);
+  head.values = ["Ticker", "Level", "What to check", "Where", "Filing", "Status"];
+  headerRow(head);
+
+  const sorted = [...checks].sort((a, b) => LEVEL_ORDER[a.level] - LEVEL_ORDER[b.level] || a.ticker.localeCompare(b.ticker));
+  let r = 5;
+  for (const c of sorted) {
+    const row = ws.getRow(r);
+    row.getCell(1).value = c.ticker;
+    row.getCell(2).value = c.level;
+    row.getCell(2).font = { bold: true, color: { argb: c.level === "Fix" ? "FFC00000" : c.level === "Review" ? "FFB45F06" : "FF595959" } };
+    row.getCell(3).value = c.message;
+    row.getCell(3).alignment = { wrapText: true, vertical: "top" };
+    row.getCell(4).value = { text: "Go to cell", hyperlink: `#${ref(c.sheet, c.cell)}` };
+    row.getCell(4).font = { color: BLUE, underline: true };
+    if (c.filing) {
+      row.getCell(5).value = { text: "Open filing", hyperlink: c.filing };
+      row.getCell(5).font = { color: BLUE, underline: true };
+    }
+    // Fix rows tick themselves off once the cell has a number in it.
+    if (c.fillCell) row.getCell(6).value = { formula: `IF(ISNUMBER(${ref(c.sheet, c.cell)}),"Done","To do")` };
+    r++;
+  }
+  if (!sorted.length) {
+    ws.getCell(`C${r}`).value = "Nothing flagged. Still spot-check revenue, EBIT, net income, shares, debt and cash against the filings.";
+    r++;
+  }
+
+  if (!stats) return;
+  // Outlier multiples: recalculates in Excel as prices are entered.
+  r += 1;
+  const oHead = ws.getRow(r);
+  oHead.values = ["Ticker", "", "Outlier multiples (more than 2x or less than half the peer median). Updates as you enter prices.", "EV / Revenue", "EV / EBITDA", "EV / EBIT", "P / E"];
+  headerRow(oHead);
+  ws.getColumn(7).width = 10;
+  for (const p of peerRows) {
+    r++;
+    ws.getCell(`A${r}`).value = p.ticker;
+    ["J", "K", "L", "M"].forEach((col, i) => {
+      const v = `Comps!${col}${p.row}`;
+      const med = `Comps!${col}${stats.median}`;
+      ws.getCell(r, 4 + i).value = {
+        formula: `IF(AND(ISNUMBER(${v}),ISNUMBER(${med})),IF(${v}>2*${med},"High",IF(${v}<0.5*${med},"Low","")),IF(${v}="NM","NM",""))`,
+      };
+    });
+  }
+  ws.views = [{ state: "frozen", ySplit: 4 }];
 }
